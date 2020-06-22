@@ -11,7 +11,7 @@ from drive import open_url
 
 
 class PULSE(torch.nn.Module):
-    def __init__(self, cache_dir, verbose=True):
+    def __init__(self, cache_dir, verbose=True, weights=None, reinit=False):
         super(PULSE, self).__init__()
 
         self.synthesis = G_synthesis().cuda()
@@ -20,8 +20,12 @@ class PULSE(torch.nn.Module):
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok = True)
         if self.verbose: print("Loading Synthesis Network")
-        with open_url("https://drive.google.com/uc?id=1TCViX1YpQyRsklTVYEJwdbmK91vklCo8", cache_dir=cache_dir, verbose=verbose) as f:
-            self.synthesis.load_state_dict(torch.load(f))
+        if weights is None:
+            with open_url("https://drive.google.com/uc?id=1TCViX1YpQyRsklTVYEJwdbmK91vklCo8", cache_dir=cache_dir, verbose=verbose) as f:
+                checkpoint = torch.load(f)
+        else:
+            checkpoint = torch.load(weights)
+        self.synthesis.load_state_dict(checkpoint)
 
         for param in self.synthesis.parameters():
             param.requires_grad = False
@@ -40,11 +44,15 @@ class PULSE(torch.nn.Module):
             if self.verbose: print("\tRunning Mapping Network")
             with torch.no_grad():
                 torch.manual_seed(0)
-                latent = torch.randn((1000000,512),dtype=torch.float32, device="cuda")
+                latent = torch.randn((1000000,512), dtype=torch.float32, device="cuda")
                 latent_out = torch.nn.LeakyReLU(5)(mapping(latent))
                 self.gaussian_fit = {"mean": latent_out.mean(0), "std": latent_out.std(0)}
                 torch.save(self.gaussian_fit,"gaussian_fit.pt")
                 if self.verbose: print("\tSaved \"gaussian_fit.pt\"")
+
+        self.reinit = reinit
+        self.last_latent = None
+        self.last_noise = None
 
     def forward(self, ref_im,
                 seed,
@@ -69,40 +77,47 @@ class PULSE(torch.nn.Module):
         batch_size = ref_im.shape[0]
 
         # Generate latent tensor
-        if(tile_latent):
-            latent = torch.randn(
-                (batch_size, 1, 512), dtype=torch.float, requires_grad=True, device='cuda')
+        if self.reinit and self.last_latent is not None:
+            latent = self.last_latent
         else:
-            latent = torch.randn(
-                (batch_size, 18, 512), dtype=torch.float, requires_grad=True, device='cuda')
+            if(tile_latent):
+                latent = torch.randn(
+                    (batch_size, 1, 512), dtype=torch.float, requires_grad=True, device='cuda')
+            else:
+                latent = torch.randn(
+                    (batch_size, 18, 512), dtype=torch.float, requires_grad=True, device='cuda')
 
         # Generate list of noise tensors
         noise = [] # stores all of the noise tensors
         noise_vars = []  # stores the noise tensors that we want to optimize on
 
-        for i in range(18):
-            # dimension of the ith noise tensor
-            res = (batch_size, 1, 2**(i//2+2), 2**(i//2+2))
+        if self.reinit and self.last_noise is not None:
+            noise, noise_vars = self.last_noise
 
-            if(noise_type == 'zero' or i in [int(layer) for layer in bad_noise_layers.split('.')]):
-                new_noise = torch.zeros(res, dtype=torch.float, device='cuda')
-                new_noise.requires_grad = False
-            elif(noise_type == 'fixed'):
-                new_noise = torch.randn(res, dtype=torch.float, device='cuda')
-                new_noise.requires_grad = False
-            elif (noise_type == 'trainable'):
-                new_noise = torch.randn(res, dtype=torch.float, device='cuda')
-                if (i < num_trainable_noise_layers):
-                    new_noise.requires_grad = True
-                    noise_vars.append(new_noise)
-                else:
+        else:
+            for i in range(18):
+                # dimension of the ith noise tensor
+                res = (batch_size, 1, 2**(i//2+2), 2**(i//2+2))
+
+                if(noise_type == 'zero' or i in [int(layer) for layer in bad_noise_layers.split('.')]):
+                    new_noise = torch.zeros(res, dtype=torch.float, device='cuda')
                     new_noise.requires_grad = False
-            else:
-                raise Exception("unknown noise type")
+                elif(noise_type == 'fixed'):
+                    new_noise = torch.randn(res, dtype=torch.float, device='cuda')
+                    new_noise.requires_grad = False
+                elif (noise_type == 'trainable'):
+                    new_noise = torch.randn(res, dtype=torch.float, device='cuda')
+                    if (i < num_trainable_noise_layers):
+                        new_noise.requires_grad = True
+                        noise_vars.append(new_noise)
+                    else:
+                        new_noise.requires_grad = False
+                else:
+                    raise Exception("unknown noise type")
 
-            noise.append(new_noise)
+                noise.append(new_noise)
 
-        var_list = [latent]+noise_vars
+        var_list = [latent] + noise_vars
 
         opt_dict = {
             'sgd': torch.optim.SGD,
@@ -135,7 +150,7 @@ class PULSE(torch.nn.Module):
             opt.opt.zero_grad()
 
             # Duplicate latent in case tile_latent = True
-            if (tile_latent):
+            if latent.size(1) == 1:
                 latent_in = latent.expand(-1, 18, -1)
             else:
                 latent_in = latent
@@ -169,11 +184,17 @@ class PULSE(torch.nn.Module):
             loss.backward()
             opt.step()
             scheduler.step()
+            if (min_l2 <= eps):
+                break
+
+        if self.reinit:
+            self.last_latent = latent
+            self.last_noise = (noise, noise_vars)
 
         total_t = time.time()-start_t
         current_info = f' | time: {total_t:.1f} | it/s: {(j+1)/total_t:.2f} | batchsize: {batch_size}'
         if self.verbose: print(best_summary+current_info)
-        if(min_l2 <= eps):
-            yield (gen_im.clone().cpu().detach().clamp(0, 1),loss_builder.D(best_im).cpu().detach().clamp(0, 1))
-        else:
-            print("Could not find a face that downscales correctly within epsilon")
+        # if(min_l2 <= eps):
+        yield (gen_im.clone().cpu().detach().clamp(0, 1),loss_builder.D(best_im).cpu().detach().clamp(0, 1))
+        # else:
+        #     print("Could not find a face that downscales correctly within epsilon")
