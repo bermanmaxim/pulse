@@ -5,7 +5,7 @@ from PIL import Image
 import numpy as np
 import cv2
 from torch.nn.functional import interpolate
-from live_predict import align_face
+from live_align import align_face
 import argparse
 import os
 from glob import glob
@@ -14,21 +14,27 @@ from glob import glob
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--input-video', type=str, default='testvid.mp4', help='directory with unprocessed images')
-parser.add_argument('--output-video', type=str, default='outvid.mp4', help='output directory')
+parser.add_argument('--output-video', type=str, default='outvid.mp4', help='output video')
 parser.add_argument('--down-size', type=int, default=32, help='size to downscale the input images to, must be power of 2')
 parser.add_argument('--seed', type=int, default=100, help='manual seed to use')
-parser.add_argument('--framerate', type=int, default=32, help='output framerate')
+parser.add_argument('--framerate', type=int, default=30, help='output framerate')
 parser.add_argument('--eps', type=float, default=0.004, help='eps for termination criterion')
 parser.add_argument('--reuse-latent', action='store_true', help='reuse latent between frames')
+parser.add_argument('--resume', action='store_true', help='resume aborted computation')
 
 args = parser.parse_args()
 
-print("extracting video frames...")
-tmpdir_in = os.path.splitext(args.input_video)[0] + '_img'
-tmpdir_out = os.path.splitext(args.input_video)[0] + '_transf'
-os.makedirs(tmpdir_in, exist_ok=True)
+tmpdir_out = os.path.splitext(args.output_video)[0] + '_img'
+
 os.makedirs(tmpdir_out, exist_ok=True)
-os.system(f"ffmpeg -i {args.input_video} '{tmpdir_in}/out%05d.png'")
+
+if os.path.splitext(args.input_video)[1] == '':
+    tmpdir_in = args.input_video
+else:
+    print("extracting video frames...")
+    tmpdir_in = os.path.splitext(args.input_video)[0] + '_img'
+    os.makedirs(tmpdir_in, exist_ok=True)
+    os.system(f"ffmpeg -i {args.input_video} '{tmpdir_in}/out%05d.png'")
 
 
 predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
@@ -82,14 +88,16 @@ def replace(pil_image):
     return np_image
 
 
-todo = glob(tmpdir_in + '/*.png')
+todo = sorted(glob(tmpdir_in + '/*.png'))
 for i, fname in enumerate(todo):
+    dest = tmpdir_out + '/' + os.path.basename(fname)
+    if args.resume and os.path.isfile(dest):
+        continue
     print(f"{i}/{len(todo)}", end=" ")
     transformed = replace(Image.open(fname))
     transformed = Image.fromarray((transformed * 255).astype(np.uint8))
-    transformed.save(tmpdir_out + '/' + os.path.basename(fname))
+    transformed.save(dest)
 
 
 os.system(f"ffmpeg -framerate {args.framerate} -pattern_type glob -i '{tmpdir_out}/*.png' "
           f"-c:v libx264 -pix_fmt yuv420p {args.output_video}")
-

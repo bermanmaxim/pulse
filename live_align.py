@@ -36,15 +36,16 @@ def get_landmark(np_img, predictor):
     return lms
 
 
-def align_face(img, predictor):
+def align_face(pil_img, predictor):
     """
     :param filepath: PIL Image
     :return: list of PIL Images
     """
 
-    lms = get_landmark(np.array(img),predictor)
+    lms = get_landmark(np.array(pil_img), predictor)
     imgs = []
     for lm in lms:
+        img = pil_img.copy()
         lm_eye_left = lm[36: 42]  # left-clockwise
         lm_eye_right = lm[42: 48]  # left-clockwise
         lm_mouth_outer = lm[48: 60]  # left-clockwise
@@ -98,7 +99,7 @@ def align_face(img, predictor):
                max(pad[3] - img.size[1] + border, 0))
         if enable_padding and max(pad) > border - 4:
             pad = np.maximum(pad, int(np.rint(qsize * 0.3)))
-            img = np.pad(np.float32(img), ((pad[1], pad[3]), (pad[0], pad[2]), (0, 0)), 'reflect')
+            img = np.pad(np.array(img).astype(np.float32), ((pad[1], pad[3]), (pad[0], pad[2]), (0, 0)), 'reflect')
             h, w, _ = img.shape
             y, x, _ = np.ogrid[:h, :w, :1]
             mask = np.maximum(1.0 - np.minimum(np.float32(x) / pad[0], np.float32(w - 1 - x) / pad[2]),
