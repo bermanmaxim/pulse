@@ -7,17 +7,29 @@ import cv2
 from torch.nn.functional import interpolate
 from live_predict import align_face
 import argparse
+import os
+from glob import glob
+
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--input-video', type=str, default='realpics', help='directory with unprocessed images')
-parser.add_argument('--output-video', type=str, default='input', help='output directory')
+parser.add_argument('--input-video', type=str, default='testvid.mp4', help='directory with unprocessed images')
+parser.add_argument('--output-video', type=str, default='outvid.mp4', help='output directory')
 parser.add_argument('--down-size', type=int, default=32, help='size to downscale the input images to, must be power of 2')
 parser.add_argument('--seed', type=int, default=100, help='manual seed to use')
+parser.add_argument('--framerate', type=int, default=32, help='output framerate')
 parser.add_argument('--eps', type=float, default=0.004, help='eps for termination criterion')
 parser.add_argument('--reuse-latent', action='store_true', help='reuse latent between frames')
 
 args = parser.parse_args()
+
+print("extracting video frames...")
+tmpdir_in = os.path.splitext(args.input_video)[0] + '_img'
+tmpdir_out = os.path.splitext(args.input_video)[0] + '_transf'
+os.makedirs(tmpdir_in, exist_ok=True)
+os.makedirs(tmpdir_out, exist_ok=True)
+os.system(f"ffmpeg -i {args.input_video} '{tmpdir_in}/out%05d.png'")
+
 
 predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
@@ -36,11 +48,10 @@ kwargs['tile_latent'] = False
 kwargs['bad_noise_layers'] = '17'
 kwargs['save_intermediate'] = False
 
-FACE_RESOLUTION = 256
-SUB_RESOLUTION = 32
+SUB_RESOLUTION = args.down_size
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-pulse_model = PULSE(cache_dir="cache", weights="cache/synthesis.pt", reinit=True)
+pulse_model = PULSE(cache_dir="cache", weights="cache/synthesis.pt", reinit=args.reuse_latent)
 # model = DataParallel(model)
 
 
@@ -71,25 +82,14 @@ def replace(pil_image):
     return np_image
 
 
-# im = Image.open('test.jpg')
-# transf = replace(im)
-# plt.imshow(transf)
-# plt.show()
+todo = glob(tmpdir_in + '/*.png')
+for i, fname in enumerate(todo):
+    print(f"{i}/{len(todo)}", end=" ")
+    transformed = replace(Image.open(fname))
+    transformed = Image.fromarray((transformed * 255).astype(np.uint8))
+    transformed.save(tmpdir_out + '/' + os.path.basename(fname))
 
-while True:
-    # Getting out image by webcam
-    _, image = cap.read()
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    transformed = replace(Image.fromarray(rgb))
-
-    # Show the image
-    cv2.imshow("Output", cv2.cvtColor(transformed, cv2.COLOR_RGB2BGR))
-
-    k = cv2.waitKey(10) & 0xFF
-    if k == 27:
-        break
-
-cv2.destroyAllWindows()
-cap.release()
+os.system(f"ffmpeg -framerate {args.framerate} -pattern_type glob -i '{tmpdir_out}/*.png' "
+          f"-c:v libx264 -pix_fmt yuv420p {args.output_video}")
 
